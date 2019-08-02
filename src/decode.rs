@@ -124,6 +124,11 @@ impl<R: AsyncRead + Unpin> MsgPackFuture<R> {
         MsgPackFuture { reader }
     }
 
+    /// Return the underlying reader without reading from it
+    pub fn into_inner(self) -> R {
+        self.reader
+    }
+
     async fn read_1(&mut self) -> IoResult<u8> {
         let mut val = [0];
         self.reader.read_exact(&mut val[..]).await?;
@@ -455,6 +460,16 @@ impl<R: AsyncRead + Unpin> ArrayFuture<R> {
         }
     }
 
+    /// If this is the last element, return a future of it's value wrapped around the
+    /// underlying reader. Avoids having to call `next()` a final time.
+    pub fn last(self) -> MsgPackOption<MsgPackFuture<R>, R> {
+        if self.len == 1 {
+            MsgPackOption::Some(MsgPackFuture::new(self.reader))
+        } else {
+            MsgPackOption::End(self.reader)
+        }
+    }
+
     /// Consume all remaining elements and return the underlying reader
     pub async fn skip(self) -> IoResult<R> {
         let mut a = self;
@@ -522,6 +537,26 @@ impl<R: AsyncRead + Unpin> ArrayFuture<R> {
             Box::from_raw(raw as *mut R)
         };
         Ok((a, *r))
+    }
+}
+
+/// Container that ensures the response message array is consumed before
+/// returning the underlying reader
+pub struct FinalizedArray<R>(ArrayFuture<R>);
+
+impl<R: AsyncRead + Unpin> FinalizedArray<R> {
+    pub async fn finish(self) -> IoResult<R> {
+        self.0.skip().await
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for FinalizedArray<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &mut [u8],
+    ) -> Poll<IoResult<usize>> {
+        ArrayFuture::poll_read(Pin::new(&mut self.as_mut().0), cx, buf)
     }
 }
 
