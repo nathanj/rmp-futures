@@ -105,6 +105,16 @@ pub enum MsgPackOption<T, U> {
     End(U),
 }
 
+impl<T, U> MsgPackOption<T, U> {
+    /// Convert to an `Option`, dropping U
+    pub fn into_option(self) -> Option<T> {
+        match self {
+            MsgPackOption::Some(t) => Some(t),
+            MsgPackOption::End(_u) => None,
+        }
+    }
+}
+
 pub struct MsgPackFuture<R> {
     reader: R,
 }
@@ -185,6 +195,22 @@ impl<R: AsyncRead + Unpin> MsgPackFuture<R> {
 
     async fn read_f64(&mut self) -> IoResult<f64> {
         Ok(BigEndian::read_f64(&self.read_8().await?))
+    }
+
+    pub async fn skip(self) -> IoResult<R> {
+        let val = self.decode().await?;
+        Ok(match val {
+            ValueFuture::Nil(r) => r,
+            ValueFuture::Boolean(_b, r) => r,
+            ValueFuture::Integer(_i, r) => r,
+            ValueFuture::F32(_f, r) => r,
+            ValueFuture::F64(_f, r) => r,
+            ValueFuture::Array(a) => a.skip().boxed_local().await?,
+            ValueFuture::Map(m) => m.skip().boxed_local().await?,
+            ValueFuture::Bin(m) => m.skip().await?,
+            ValueFuture::String(s) => s.skip().await?,
+            ValueFuture::Ext(e) => e.skip().await?,
+        })
     }
 
     pub async fn decode(mut self) -> IoResult<ValueFuture<R>> {
@@ -429,6 +455,21 @@ impl<R: AsyncRead + Unpin> ArrayFuture<R> {
         }
     }
 
+    /// Consume all remaining elements and return the underlying reader
+    pub async fn skip(self) -> IoResult<R> {
+        let mut a = self;
+        loop {
+            match a.next() {
+                MsgPackOption::Some(m) => {
+                    a = m.skip().await?;
+                }
+                MsgPackOption::End(r) => {
+                    break Ok(r);
+                }
+            }
+        }
+    }
+
     pub async fn into_value(self) -> IoResult<(Value, R)>
     where
         R: 'static,
@@ -518,6 +559,22 @@ impl<R: AsyncRead + Unpin> MapFuture<R> {
         }
     }
 
+    /// Consume all remaining elements and return the underlying reader
+    pub async fn skip(self) -> IoResult<R> {
+        let mut map = self;
+        loop {
+            match map.next_key() {
+                MsgPackOption::Some(m) => {
+                    let val = m.skip().await?;
+                    map = val.next_value().skip().await?;
+                }
+                MsgPackOption::End(r) => {
+                    break Ok(r);
+                }
+            }
+        }
+    }
+
     pub async fn into_value(self) -> IoResult<(Value, R)>
     where
         R: 'static,
@@ -595,6 +652,17 @@ impl<R: AsyncRead + Unpin> MapValueFuture<R> {
     }
 }
 
+/// Discard n bytes from a reader
+async fn reader_skip<R: AsyncRead + Unpin>(reader: &mut R, mut n: usize) -> IoResult<()> {
+    let mut buf = [0; 32];
+    while n > 0 {
+        let to_read = std::cmp::min(n, buf.len());
+        reader.read_exact(&mut buf[..to_read]).await?;
+        n -= to_read;
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct BinFuture<R> {
     reader: R,
@@ -631,6 +699,11 @@ impl<R: AsyncRead + Unpin> BinFuture<R> {
             .map(|_| (vec, self.reader))
     }
 
+    pub async fn skip(mut self) -> IoResult<R> {
+        reader_skip(&mut self.reader, self.len).await?;
+        Ok(self.reader)
+    }
+
     pub async fn into_value(self) -> IoResult<(Value, R)> {
         self.into_vec().await.map(|(v, r)| (Value::Binary(v), r))
     }
@@ -646,6 +719,10 @@ impl<R: AsyncRead + Unpin> StringFuture<R> {
                 .map_err(|_| ErrorKind::InvalidData.into())
                 .map(|s| (s, r))
         })
+    }
+
+    pub async fn skip(self) -> IoResult<R> {
+        self.0.skip().await
     }
 
     pub async fn into_value(self) -> IoResult<(Value, R)> {
@@ -683,6 +760,10 @@ impl<R: AsyncRead + Unpin> ExtFuture<R> {
     pub async fn into_vec(self) -> IoResult<(i8, Vec<u8>, R)> {
         let ty = self.ty;
         self.bin.into_vec().await.map(|(v, r)| (ty, v, r))
+    }
+
+    pub async fn skip(self) -> IoResult<R> {
+        self.bin.skip().await
     }
 
     pub async fn into_value(self) -> IoResult<(Value, R)> {
