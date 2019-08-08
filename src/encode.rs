@@ -252,13 +252,13 @@ fn efficient_i64() {
     );
 }
 
-pub struct MsgPackSink<W> {
+pub struct MsgPackWriter<W> {
     writer: W,
 }
 
-impl<W: AsyncWrite + Unpin> MsgPackSink<W> {
+impl<W: AsyncWrite + Unpin> MsgPackWriter<W> {
     pub fn new(writer: W) -> Self {
-        MsgPackSink { writer }
+        MsgPackWriter { writer }
     }
 
     pub fn into_inner(self) -> W {
@@ -405,7 +405,7 @@ impl<W: AsyncWrite + Unpin> MsgPackSink<W> {
     }
 
     // TODO: return arraywriter
-    pub async fn write_array_len(mut self, len: u32) -> IoResult<W> {
+    pub async fn write_array_len(mut self, len: u32) -> IoResult<ArrayFuture<W>> {
         const U16MAX: u32 = std::u16::MAX as u32;
 
         match len {
@@ -419,7 +419,10 @@ impl<W: AsyncWrite + Unpin> MsgPackSink<W> {
                 self.write_u32(len).await
             }
         }
-        .map(|()| self.writer)
+        .map(|()| ArrayFuture {
+            len: len as usize,
+            writer: self.writer,
+        })
     }
 
     // TODO: return map writer
@@ -571,16 +574,17 @@ impl<W: AsyncWrite + Unpin> MsgPackSink<W> {
                 let mut w = self.write_array_len(a.len().try_into().unwrap()).await?;
                 for elem in a.iter() {
                     // Box future to allow recursion
-                    w = MsgPackSink::new(w).write_value(elem).boxed_local().await?;
+                    let m = w.next().into_option().unwrap();
+                    w = m.write_value(elem).boxed_local().await?;
                 }
-                Ok(w)
+                Ok(w.next().unwrap_end())
             }
             Value::Map(m) => {
                 let mut w = self.write_map_len(m.len().try_into().unwrap()).await?;
                 for (k, v) in m.iter() {
                     // Box future to allow recursion
-                    w = MsgPackSink::new(w).write_value(k).boxed_local().await?;
-                    w = MsgPackSink::new(w).write_value(v).boxed_local().await?;
+                    w = MsgPackWriter::new(w).write_value(k).boxed_local().await?;
+                    w = MsgPackWriter::new(w).write_value(v).boxed_local().await?;
                 }
                 Ok(w)
             }
@@ -589,7 +593,7 @@ impl<W: AsyncWrite + Unpin> MsgPackSink<W> {
     }
 }
 
-impl<W: AsyncWrite + Unpin> AsyncWrite for MsgPackSink<W> {
+impl<W: AsyncWrite + Unpin> AsyncWrite for MsgPackWriter<W> {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<IoResult<usize>> {
         W::poll_write(Pin::new(&mut self.as_mut().writer), cx, buf)
     }
@@ -603,6 +607,55 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for MsgPackSink<W> {
     }
 }
 
+#[derive(Debug)]
+pub struct ArrayFuture<R> {
+    writer: R,
+    len: usize,
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for ArrayFuture<W> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<IoResult<usize>> {
+        W::poll_write(Pin::new(&mut self.as_mut().writer), cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<IoResult<()>> {
+        W::poll_flush(Pin::new(&mut self.as_mut().writer), cx)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<IoResult<()>> {
+        W::poll_close(Pin::new(&mut self.as_mut().writer), cx)
+    }
+}
+
+impl<W: AsyncWrite + Unpin> ArrayFuture<W> {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn next(mut self) -> MsgPackOption<MsgPackWriter<Self>, W> {
+        if self.len > 0 {
+            self.len -= 1;
+            MsgPackOption::Some(MsgPackWriter::new(self))
+        } else {
+            MsgPackOption::End(self.writer)
+        }
+    }
+
+    /// If this is the last element, return a future of it's value wrapped around the
+    /// underlying writer. Avoids having to call `next()` a final time.
+    pub fn last(self) -> MsgPackOption<MsgPackWriter<W>, W> {
+        if self.len == 1 {
+            MsgPackOption::Some(MsgPackWriter::new(self.writer))
+        } else {
+            MsgPackOption::End(self.writer)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,19 +665,19 @@ mod tests {
         futures::executor::LocalPool::new().run_until(f)
     }
 
-    /// Create a 2 writable cursors and wrap one in a `MsgPackSink` call a
-    /// function to write with rmp::encode and MsgPackSink, and return an
-    /// optional rmpv::Value that will get encoded with MsgPackSink::write_value.
+    /// Create a 2 writable cursors and wrap one in a `MsgPackWriter` call a
+    /// function to write with rmp::encode and MsgPackWriter, and return an
+    /// optional rmpv::Value that will get encoded with MsgPackWriter::write_value.
     /// All three will be checked for equality.
     fn test_jig<F>(f: F)
     where
         F: FnOnce(
             &mut Cursor<Vec<u8>>,
-            MsgPackSink<Cursor<Vec<u8>>>,
+            MsgPackWriter<Cursor<Vec<u8>>>,
         ) -> (Option<Value>, Cursor<Vec<u8>>),
     {
         let mut c1 = Cursor::new(vec![0; 256]);
-        let msg1 = MsgPackSink::new(Cursor::new(vec![0; 256]));
+        let msg1 = MsgPackWriter::new(Cursor::new(vec![0; 256]));
         let (val, msg1) = f(&mut c1, msg1);
 
         let b1 = c1.into_inner();
@@ -633,7 +686,7 @@ mod tests {
         assert_eq!(b1, b2);
 
         if let Some(val) = val {
-            let msg2 = MsgPackSink::new(Cursor::new(vec![0; 256]));
+            let msg2 = MsgPackWriter::new(Cursor::new(vec![0; 256]));
             // Encode the `Value`
             let msg2 = run_future(msg2.write_value(&val)).unwrap();
             let b3 = msg2.into_inner();
@@ -690,7 +743,7 @@ mod tests {
         for i in &[0, 1, 15, 16, 65535, 65536, std::u32::MAX] {
             test_jig(|c1, msg| {
                 rmp::encode::write_array_len(c1, *i).unwrap();
-                (None, run_future(msg.write_array_len(*i)).unwrap())
+                (None, run_future(msg.write_array_len(*i)).unwrap().writer)
             });
         }
     }
@@ -702,8 +755,11 @@ mod tests {
             rmp::encode::write_uint(c1, 1).unwrap();
             let f = msg
                 .write_array_len(1)
-                .and_then(|w| MsgPackSink::new(w).write_int(1));
-            (Some(Value::Array(vec![1.into()])), run_future(f).unwrap())
+                .and_then(|a| a.next().unwrap().write_int(1));
+            (
+                Some(Value::Array(vec![1.into()])),
+                run_future(f).unwrap().next().unwrap_end(),
+            )
         })
     }
 
